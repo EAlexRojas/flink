@@ -57,6 +57,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -98,6 +99,9 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 
 	/** Configuration key to define the consumer's partition discovery interval, in milliseconds. */
 	public static final String KEY_PARTITION_DISCOVERY_INTERVAL_MILLIS = "flink.partition-discovery.interval-millis";
+
+	/** Boolean configuration key to ignore invalid topics recovered from state. */
+	public static final String KEY_IGNORE_INVALID_RECOVERED_TOPICS = "flink.ignore-invalid-recovered-topics";
 
 	/** State name of the consumer's partition offset states. */
 	private static final String OFFSETS_STATE_NAME = "topic-partition-offset-states";
@@ -185,6 +189,9 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 	/** Flag indicating whether the consumer is still running. */
 	private volatile boolean running = true;
 
+	/** Flag indicating whether or not invalid topics recovered from state should be ignored.*/
+	private final boolean ignoreInvalidRecoveredTopics;
+
 	// ------------------------------------------------------------------------
 	//  internal metrics
 	// ------------------------------------------------------------------------
@@ -226,7 +233,8 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 			Pattern topicPattern,
 			KeyedDeserializationSchema<T> deserializer,
 			long discoveryIntervalMillis,
-			boolean useMetrics) {
+			boolean useMetrics,
+			boolean ignoreInvalidRecoveredTopics) {
 		this.topicsDescriptor = new KafkaTopicsDescriptor(topics, topicPattern);
 		this.deserializer = checkNotNull(deserializer, "valueDeserializer");
 
@@ -236,6 +244,8 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 		this.discoveryIntervalMillis = discoveryIntervalMillis;
 
 		this.useMetrics = useMetrics;
+
+		this.ignoreInvalidRecoveredTopics = ignoreInvalidRecoveredTopics;
 	}
 
 	// ------------------------------------------------------------------------
@@ -432,13 +442,23 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 				}
 			}
 
-			for (Map.Entry<KafkaTopicPartition, Long> restoredStateEntry : restoredState.entrySet()) {
+			Iterator<Map.Entry<KafkaTopicPartition, Long>> iter = restoredState.entrySet().iterator();
+			while (iter.hasNext()) {
+				Map.Entry<KafkaTopicPartition, Long> restoredStateEntry = iter.next();
+
+				// After adding new partitions, restoredState should contain all partitions
+				// but restoredStated could contain partitions that are no longer available
+				// in that case, those partitions should be removed
+				if (this.ignoreInvalidRecoveredTopics && !allPartitions.contains(restoredStateEntry.getKey())) {
+					iter.remove();
+					continue;
+				}
 				if (!restoredFromOldState) {
 					// seed the partition discoverer with the union state while filtering out
 					// restored partitions that should not be subscribed by this subtask
 					if (KafkaTopicPartitionAssigner.assign(
 						restoredStateEntry.getKey(), getRuntimeContext().getNumberOfParallelSubtasks())
-							== getRuntimeContext().getIndexOfThisSubtask()){
+						== getRuntimeContext().getIndexOfThisSubtask()){
 						subscribedPartitionsToStartOffsets.put(restoredStateEntry.getKey(), restoredStateEntry.getValue());
 					}
 				} else {

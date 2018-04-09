@@ -640,6 +640,7 @@ public class FlinkKafkaConsumerBaseTest {
 					null,
 					(KeyedDeserializationSchema < T >) mock(KeyedDeserializationSchema.class),
 					PARTITION_DISCOVERY_DISABLED,
+					false,
 					false);
 
 			this.testFetcher = testFetcher;
