@@ -785,6 +785,10 @@ public class FlinkKafkaConsumerBaseTest {
 		}
 
 		@Override
+		protected void addPartitionsToBeRemoved(List<KafkaTopicPartition> partitionsToRemove) {
+		}
+
+		@Override
 		public void runFetchLoop() throws Exception {
 			runLatch.trigger();
 			stopLatch.await();

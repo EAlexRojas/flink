@@ -35,6 +35,7 @@ import javax.annotation.Nullable;
 
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -414,6 +415,10 @@ public class AbstractFetcherTest {
 				TestFetcher.class.getClassLoader(),
 				new UnregisteredMetricsGroup(),
 				false);
+		}
+
+		@Override
+		protected void addPartitionsToBeRemoved(List<KafkaTopicPartition> partitionsToRemove) {
 		}
 
 		@Override

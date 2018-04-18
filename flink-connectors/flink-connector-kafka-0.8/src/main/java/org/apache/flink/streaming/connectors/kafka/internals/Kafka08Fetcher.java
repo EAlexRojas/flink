@@ -342,6 +342,11 @@ public class Kafka08Fetcher<T> extends AbstractFetcher<T, TopicAndPartition> {
 		return new TopicAndPartition(partition.getTopic(), partition.getPartition());
 	}
 
+	@Override
+	protected void addPartitionsToBeRemoved(List<KafkaTopicPartition> partitionsToRemove) {
+		throw new UnsupportedOperationException();
+	}
+
 	// ------------------------------------------------------------------------
 	//  Offset handling
 	// ------------------------------------------------------------------------

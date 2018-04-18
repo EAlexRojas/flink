@@ -721,7 +721,8 @@ public class KafkaConsumerThreadTest {
 					0,
 					false,
 					new UnregisteredMetricsGroup(),
-					new UnregisteredMetricsGroup());
+					new UnregisteredMetricsGroup(),
+					new ArrayList<>());
 
 			this.mockConsumer = mockConsumer;
 		}
@@ -748,7 +749,7 @@ public class KafkaConsumerThreadTest {
 		}
 
 		@Override
-		void reassignPartitions(List<KafkaTopicPartitionState<TopicPartition>> newPartitions) throws Exception {
+		void reassignPartitions(List<KafkaTopicPartitionState<TopicPartition>> newPartitions, List<TopicPartition> partitionsToBeRemoved) throws Exception {
 			// triggers blocking calls on waitPartitionReassignmentInvoked()
 			preReassignmentLatch.trigger();
 
@@ -756,7 +757,7 @@ public class KafkaConsumerThreadTest {
 			startReassignmentLatch.await();
 
 			try {
-				super.reassignPartitions(newPartitions);
+				super.reassignPartitions(newPartitions, partitionsToBeRemoved);
 			} finally {
 				// triggers blocking calls on waitPartitionReassignmentComplete()
 				reassignmentCompleteLatch.trigger();

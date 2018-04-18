@@ -44,6 +44,7 @@ import org.apache.flink.streaming.connectors.kafka.config.OffsetCommitModes;
 import org.apache.flink.streaming.connectors.kafka.config.StartupMode;
 import org.apache.flink.streaming.connectors.kafka.internals.AbstractFetcher;
 import org.apache.flink.streaming.connectors.kafka.internals.AbstractPartitionDiscoverer;
+import org.apache.flink.streaming.connectors.kafka.internals.AbstractPartitionDiscoverer.DiscoveryType;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaCommitCallback;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartition;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionAssigner;
@@ -694,7 +695,9 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 					try {
 						// --------------------- partition discovery loop ---------------------
 
-						List<KafkaTopicPartition> discoveredPartitions;
+						Map<DiscoveryType, List<KafkaTopicPartition>> discoveredPartitions;
+						List<KafkaTopicPartition> newDiscoveredPartitions;
+						List<KafkaTopicPartition> partitionsToBeRemoved;
 
 						// throughout the loop, we always eagerly check if we are still running before
 						// performing the next operation, so that we can escape the loop as soon as possible
@@ -705,7 +708,9 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 							}
 
 							try {
-								discoveredPartitions = partitionDiscoverer.discoverPartitions();
+								discoveredPartitions = partitionDiscoverer.discoverNewAndUnavailablePartitions(checkUnavailableTopics);
+								newDiscoveredPartitions = discoveredPartitions.get(DiscoveryType.DISCOVERED_NEW_PARTITIONS);
+								partitionsToBeRemoved = discoveredPartitions.get(DiscoveryType.DISCOVERED_UNAVAILABLE_PARTITIONS);
 							} catch (AbstractPartitionDiscoverer.WakeupException | AbstractPartitionDiscoverer.ClosedException e) {
 								// the partition discoverer may have been closed or woken up before or during the discovery;
 								// this would only happen if the consumer was canceled; simply escape the loop
@@ -713,8 +718,11 @@ public abstract class FlinkKafkaConsumerBase<T> extends RichParallelSourceFuncti
 							}
 
 							// no need to add the discovered partitions if we were closed during the meantime
-							if (running && !discoveredPartitions.isEmpty()) {
-								kafkaFetcher.addDiscoveredPartitions(discoveredPartitions);
+							if (running && !newDiscoveredPartitions.isEmpty()) {
+								kafkaFetcher.addDiscoveredPartitions(newDiscoveredPartitions);
+							}
+							if (running && !partitionsToBeRemoved.isEmpty()) {
+								kafkaFetcher.removePartitions(partitionsToBeRemoved);
 							}
 
 							// do not waste any time sleeping if we're not running anymore

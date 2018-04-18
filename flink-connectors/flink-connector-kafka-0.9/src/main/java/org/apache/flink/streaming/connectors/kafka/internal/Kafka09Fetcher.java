@@ -112,7 +112,8 @@ public class Kafka09Fetcher<T> extends AbstractFetcher<T, TopicPartition> {
 				pollTimeout,
 				useMetrics,
 				consumerMetricGroup,
-				subtaskMetricGroup);
+				subtaskMetricGroup,
+				partitionsToBeRemoved);
 	}
 
 	// ------------------------------------------------------------------------
@@ -213,6 +214,16 @@ public class Kafka09Fetcher<T> extends AbstractFetcher<T, TopicPartition> {
 	@Override
 	public TopicPartition createKafkaPartitionHandle(KafkaTopicPartition partition) {
 		return new TopicPartition(partition.getTopic(), partition.getPartition());
+	}
+
+	@Override
+	protected void addPartitionsToBeRemoved(List<KafkaTopicPartition> partitionsToRemove) {
+		for (KafkaTopicPartition ptr : partitionsToRemove) {
+			TopicPartition partition = new TopicPartition(ptr.getTopic(), ptr.getPartition());
+			if (!partitionsToBeRemoved.contains(partition)) {
+				partitionsToBeRemoved.add(partition);
+			}
+		}
 	}
 
 	@Override
