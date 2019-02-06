@@ -26,7 +26,8 @@ import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.common.typeutils.SimpleTypeSerializerSnapshot;
+import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility;
 import org.apache.flink.api.common.typeutils.TypeSerializerSnapshot;
 import org.apache.flink.api.common.typeutils.base.TypeSerializerSingleton;
 import org.apache.flink.api.java.ClosureCleaner;
@@ -84,6 +85,7 @@ import java.util.Set;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
@@ -822,7 +824,12 @@ public class FlinkKafkaProducer011<IN>
 			semantic = Semantic.NONE;
 		}
 
-		migrateNextTransactionalIdHindState(context);
+		nextTransactionalIdHintState = context.getOperatorStateStore().getUnionListState(NEXT_TRANSACTIONAL_ID_HINT_DESCRIPTOR_V2);
+
+		// Only migrate state if there anything to migrate. This prevents to register old descriptor when not needed
+		if (context.getOperatorStateStore().getRegisteredStateNames().contains(NEXT_TRANSACTIONAL_ID_HINT_DESCRIPTOR)) {
+			migrateNextTransactionalIdHindState(context);
+		}
 
 		transactionalIdsGenerator = new TransactionalIdsGenerator(
 			getRuntimeContext().getTaskName() + "-" + ((StreamingRuntimeContext) getRuntimeContext()).getOperatorUniqueID(),
@@ -1010,9 +1017,7 @@ public class FlinkKafkaProducer011<IN>
 
 	private void migrateNextTransactionalIdHindState(FunctionInitializationContext context) throws Exception {
 		ListState<NextTransactionalIdHint> oldNextTransactionalIdHintState = context.getOperatorStateStore().getUnionListState(
-			NEXT_TRANSACTIONAL_ID_HINT_DESCRIPTOR);
-		nextTransactionalIdHintState = context.getOperatorStateStore().getUnionListState(NEXT_TRANSACTIONAL_ID_HINT_DESCRIPTOR_V2);
-
+				NEXT_TRANSACTIONAL_ID_HINT_DESCRIPTOR);
 		ArrayList<NextTransactionalIdHint> oldTransactionalIdHints = Lists.newArrayList(oldNextTransactionalIdHintState.get());
 		if (!oldTransactionalIdHints.isEmpty()) {
 			nextTransactionalIdHintState.addAll(oldTransactionalIdHints);
@@ -1263,9 +1268,71 @@ public class FlinkKafkaProducer011<IN>
 		 * Serializer configuration snapshot for compatibility and format evolution.
 		 */
 		@SuppressWarnings("WeakerAccess")
-		public static final class TransactionStateSerializerSnapshot extends SimpleTypeSerializerSnapshot<KafkaTransactionState> {
+		public static final class TransactionStateSerializerSnapshot implements TypeSerializerSnapshot<KafkaTransactionState> {
+
+			private static final int CURRENT_VERSION = 1;
+
+			/**
+			 * The class of the serializer for this snapshot.
+			 */
+			private Supplier<? extends TypeSerializer<KafkaTransactionState>> serializerSupplier;
+
 			public TransactionStateSerializerSnapshot() {
-				super(TransactionStateSerializer::new);
+				serializerSupplier = TransactionStateSerializer::new;
+			}
+
+			@Override
+			public int getCurrentVersion() {
+				return CURRENT_VERSION;
+			}
+
+			@Override
+			public TypeSerializer<KafkaTransactionState> restoreSerializer() {
+				return serializerSupplier.get();
+			}
+
+			@Override
+			public TypeSerializerSchemaCompatibility<KafkaTransactionState>
+			resolveSchemaCompatibility(TypeSerializer<KafkaTransactionState> newSerializer) {
+				if (newSerializer.getClass() == serializerSupplier.get().getClass()) {
+					return TypeSerializerSchemaCompatibility.compatibleAsIs();
+				} else if (newSerializer.getClass().getCanonicalName().contains("TransactionStateSerializer")) {
+					return TypeSerializerSchemaCompatibility.compatibleAfterMigration();
+				} else {
+					return TypeSerializerSchemaCompatibility.incompatible();
+				}
+			}
+
+			@Override
+			public void writeSnapshot(DataOutputView out) throws IOException {
+				//
+			}
+
+			@Override
+			public void readSnapshot(int readVersion, DataInputView in, ClassLoader userCodeClassLoader) throws IOException {
+				switch (readVersion) {
+					case 1: {
+						break;
+					}
+					default: {
+						throw new IOException("Unrecognized version: " + readVersion);
+					}
+				}
+			}
+
+			@Override
+			public final boolean equals(Object obj) {
+				return obj != null && obj.getClass() == getClass();
+			}
+
+			@Override
+			public final int hashCode() {
+				return getClass().hashCode();
+			}
+
+			@Override
+			public String toString() {
+				return getClass().getName();
 			}
 		}
 	}
@@ -1362,9 +1429,70 @@ public class FlinkKafkaProducer011<IN>
 		 * Serializer configuration snapshot for compatibility and format evolution.
 		 */
 		@SuppressWarnings("WeakerAccess")
-		public static final class ContextStateSerializerSnapshot extends SimpleTypeSerializerSnapshot<KafkaTransactionContext> {
+		public static final class ContextStateSerializerSnapshot implements TypeSerializerSnapshot<KafkaTransactionContext> {
+
+			private static final int CURRENT_VERSION = 1;
+
+			/**
+			 * The class of the serializer for this snapshot.
+			 */
+			private Supplier<? extends TypeSerializer<KafkaTransactionContext>> serializerSupplier;
+
 			public ContextStateSerializerSnapshot() {
-				super(ContextStateSerializer::new);
+				serializerSupplier = ContextStateSerializer::new;
+			}
+
+			@Override
+			public int getCurrentVersion() {
+				return CURRENT_VERSION;
+			}
+
+			@Override
+			public TypeSerializer<KafkaTransactionContext> restoreSerializer() {
+				return serializerSupplier.get();
+			}
+
+			@Override
+			public TypeSerializerSchemaCompatibility<KafkaTransactionContext> resolveSchemaCompatibility(TypeSerializer<KafkaTransactionContext> newSerializer) {
+				if (newSerializer.getClass() == serializerSupplier.get().getClass()) {
+					return TypeSerializerSchemaCompatibility.compatibleAsIs();
+				} else if (newSerializer.getClass().getCanonicalName().contains("ContextStateSerializer")) {
+					return TypeSerializerSchemaCompatibility.compatibleAfterMigration();
+				} else {
+					return TypeSerializerSchemaCompatibility.incompatible();
+				}
+			}
+
+			@Override
+			public void writeSnapshot(DataOutputView out) throws IOException {
+				//
+			}
+
+			@Override
+			public void readSnapshot(int readVersion, DataInputView in, ClassLoader userCodeClassLoader) throws IOException {
+				switch (readVersion) {
+					case 1: {
+						break;
+					}
+					default: {
+						throw new IOException("Unrecognized version: " + readVersion);
+					}
+				}
+			}
+
+			@Override
+			public final boolean equals(Object obj) {
+				return obj != null && obj.getClass() == getClass();
+			}
+
+			@Override
+			public final int hashCode() {
+				return getClass().hashCode();
+			}
+
+			@Override
+			public String toString() {
+				return getClass().getName();
 			}
 		}
 	}
@@ -1480,6 +1608,82 @@ public class FlinkKafkaProducer011<IN>
 		@Override
 		public boolean canEqual(Object obj) {
 			return obj instanceof FlinkKafkaProducer011.NextTransactionalIdHintSerializer;
+		}
+
+		@Override
+		public TypeSerializerSnapshot<NextTransactionalIdHint> snapshotConfiguration() {
+			return new NextTransactionalIdHintSerializerSnapshot();
+		}
+
+		/**
+		 * Serializer configuration snapshot for compatibility and format evolution.
+		 */
+		@SuppressWarnings("WeakerAccess")
+		public static final class NextTransactionalIdHintSerializerSnapshot implements TypeSerializerSnapshot<NextTransactionalIdHint> {
+
+			private static final int CURRENT_VERSION = 1;
+
+			/**
+			 * The class of the serializer for this snapshot.
+			 */
+			private Supplier<? extends TypeSerializer<NextTransactionalIdHint>> serializerSupplier;
+
+			public NextTransactionalIdHintSerializerSnapshot() {
+				serializerSupplier = NextTransactionalIdHintSerializer::new;
+			}
+
+			@Override
+			public int getCurrentVersion() {
+				return CURRENT_VERSION;
+			}
+
+			@Override
+			public TypeSerializer<NextTransactionalIdHint> restoreSerializer() {
+				return serializerSupplier.get();
+			}
+
+			@Override
+			public TypeSerializerSchemaCompatibility<NextTransactionalIdHint> resolveSchemaCompatibility(TypeSerializer<NextTransactionalIdHint> newSerializer) {
+				if (newSerializer.getClass() == serializerSupplier.get().getClass()) {
+					return TypeSerializerSchemaCompatibility.compatibleAsIs();
+				} else if (newSerializer.getClass().getCanonicalName().contains("NextTransactionalIdHintSerializer")) {
+					return TypeSerializerSchemaCompatibility.compatibleAfterMigration();
+				} else {
+					return TypeSerializerSchemaCompatibility.incompatible();
+				}
+			}
+
+			@Override
+			public void writeSnapshot(DataOutputView out) throws IOException {
+				//
+			}
+
+			@Override
+			public void readSnapshot(int readVersion, DataInputView in, ClassLoader userCodeClassLoader) throws IOException {
+				switch (readVersion) {
+					case 1: {
+						break;
+					}
+					default: {
+						throw new IOException("Unrecognized version: " + readVersion);
+					}
+				}
+			}
+
+			@Override
+			public final boolean equals(Object obj) {
+				return obj != null && obj.getClass() == getClass();
+			}
+
+			@Override
+			public final int hashCode() {
+				return getClass().hashCode();
+			}
+
+			@Override
+			public String toString() {
+				return getClass().getName();
+			}
 		}
 	}
 
