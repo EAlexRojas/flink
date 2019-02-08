@@ -42,6 +42,8 @@ import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.streaming.connectors.kafka.internal.FlinkKafkaProducer;
 import org.apache.flink.streaming.connectors.kafka.internal.TransactionalIdsGenerator;
 import org.apache.flink.streaming.connectors.kafka.internal.metrics.KafkaMetricMutableWrapper;
+import org.apache.flink.streaming.connectors.kafka.internals.AbstractKafkaTransactionContext;
+import org.apache.flink.streaming.connectors.kafka.internals.AbstractKafkaTransactionState;
 import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkFixedPartitioner;
 import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkKafkaDelegatePartitioner;
 import org.apache.flink.streaming.connectors.kafka.partitioner.FlinkKafkaPartitioner;
@@ -97,7 +99,7 @@ import static org.apache.flink.util.Preconditions.checkState;
  */
 @PublicEvolving
 public class FlinkKafkaProducer011<IN>
-		extends TwoPhaseCommitSinkFunction<IN, FlinkKafkaProducer011.KafkaTransactionState, FlinkKafkaProducer011.KafkaTransactionContext> {
+		extends TwoPhaseCommitSinkFunction<IN, AbstractKafkaTransactionState, AbstractKafkaTransactionContext> {
 
 	/**
 	 *  Semantics that can be chosen.
@@ -621,7 +623,7 @@ public class FlinkKafkaProducer011<IN>
 	}
 
 	@Override
-	public void invoke(KafkaTransactionState transaction, IN next, Context context) throws FlinkKafka011Exception {
+	public void invoke(AbstractKafkaTransactionState transaction, IN next, Context context) throws FlinkKafka011Exception {
 		checkErroneous();
 
 		byte[] serializedKey = schema.serializeKey(next);
@@ -639,7 +641,7 @@ public class FlinkKafkaProducer011<IN>
 		ProducerRecord<byte[], byte[]> record;
 		int[] partitions = topicPartitionsMap.get(targetTopic);
 		if (null == partitions) {
-			partitions = getPartitionsByTopic(targetTopic, transaction.producer);
+			partitions = getPartitionsByTopic(targetTopic, transaction.getProducer());
 			topicPartitionsMap.put(targetTopic, partitions);
 		}
 		if (flinkKafkaPartitioner != null) {
@@ -653,12 +655,12 @@ public class FlinkKafkaProducer011<IN>
 			record = new ProducerRecord<>(targetTopic, null, timestamp, serializedKey, serializedValue);
 		}
 		pendingRecords.incrementAndGet();
-		transaction.producer.send(record, callback);
+		transaction.getProducer().send(record, callback);
 	}
 
 	@Override
 	public void close() throws FlinkKafka011Exception {
-		final KafkaTransactionState currentTransaction = currentTransaction();
+		final AbstractKafkaTransactionState currentTransaction = currentTransaction();
 		if (currentTransaction != null) {
 			// to avoid exceptions on aborting transactions with some pending records
 			flush(currentTransaction);
@@ -670,7 +672,7 @@ public class FlinkKafkaProducer011<IN>
 					break;
 				case AT_LEAST_ONCE:
 				case NONE:
-					currentTransaction.producer.close();
+					currentTransaction.getProducer().close();
 					break;
 			}
 		}
@@ -683,14 +685,14 @@ public class FlinkKafkaProducer011<IN>
 		// make sure we propagate pending errors
 		checkErroneous();
 		pendingTransactions().forEach(transaction ->
-			IOUtils.closeQuietly(transaction.getValue().producer)
+			IOUtils.closeQuietly(transaction.getValue().getProducer())
 		);
 	}
 
 	// ------------------- Logic for handling checkpoint flushing -------------------------- //
 
 	@Override
-	protected KafkaTransactionState beginTransaction() throws FlinkKafka011Exception {
+	protected AbstractKafkaTransactionState beginTransaction() throws FlinkKafka011Exception {
 		switch (semantic) {
 			case EXACTLY_ONCE:
 				FlinkKafkaProducer<byte[], byte[]> producer = createTransactionalProducer();
@@ -699,9 +701,9 @@ public class FlinkKafkaProducer011<IN>
 			case AT_LEAST_ONCE:
 			case NONE:
 				// Do not create new producer on each beginTransaction() if it is not necessary
-				final KafkaTransactionState currentTransaction = currentTransaction();
-				if (currentTransaction != null && currentTransaction.producer != null) {
-					return new KafkaTransactionState(currentTransaction.producer);
+				final KafkaTransactionState currentTransaction = (KafkaTransactionState) currentTransaction();
+				if (currentTransaction != null && currentTransaction.getProducer() != null) {
+					return new KafkaTransactionState((FlinkKafkaProducer) currentTransaction.getProducer());
 				}
 				return new KafkaTransactionState(initNonTransactionalProducer(true));
 			default:
@@ -710,7 +712,7 @@ public class FlinkKafkaProducer011<IN>
 	}
 
 	@Override
-	protected void preCommit(KafkaTransactionState transaction) throws FlinkKafka011Exception {
+	protected void preCommit(AbstractKafkaTransactionState transaction) throws FlinkKafka011Exception {
 		switch (semantic) {
 			case EXACTLY_ONCE:
 			case AT_LEAST_ONCE:
@@ -725,23 +727,23 @@ public class FlinkKafkaProducer011<IN>
 	}
 
 	@Override
-	protected void commit(KafkaTransactionState transaction) {
+	protected void commit(AbstractKafkaTransactionState transaction) {
 		if (transaction.isTransactional()) {
 			try {
-				transaction.producer.commitTransaction();
+				transaction.getProducer().commitTransaction();
 			} finally {
-				recycleTransactionalProducer(transaction.producer);
+				recycleTransactionalProducer((FlinkKafkaProducer) transaction.getProducer());
 			}
 		}
 	}
 
 	@Override
-	protected void recoverAndCommit(KafkaTransactionState transaction) {
+	protected void recoverAndCommit(AbstractKafkaTransactionState transaction) {
 		if (transaction.isTransactional()) {
 			try (
 				FlinkKafkaProducer<byte[], byte[]> producer =
-					initTransactionalProducer(transaction.transactionalId, false)) {
-				producer.resumeTransaction(transaction.producerId, transaction.epoch);
+					initTransactionalProducer(transaction.getTransactionalId(), false)) {
+				producer.resumeTransaction(transaction.getProducerId(), transaction.getEpoch());
 				producer.commitTransaction();
 			} catch (InvalidTxnStateException | ProducerFencedException ex) {
 				// That means we have committed this transaction before.
@@ -754,19 +756,19 @@ public class FlinkKafkaProducer011<IN>
 	}
 
 	@Override
-	protected void abort(KafkaTransactionState transaction) {
+	protected void abort(AbstractKafkaTransactionState transaction) {
 		if (transaction.isTransactional()) {
-			transaction.producer.abortTransaction();
-			recycleTransactionalProducer(transaction.producer);
+			transaction.getProducer().abortTransaction();
+			recycleTransactionalProducer((FlinkKafkaProducer) transaction.getProducer());
 		}
 	}
 
 	@Override
-	protected void recoverAndAbort(KafkaTransactionState transaction) {
+	protected void recoverAndAbort(AbstractKafkaTransactionState transaction) {
 		if (transaction.isTransactional()) {
 			try (
 				FlinkKafkaProducer<byte[], byte[]> producer =
-					initTransactionalProducer(transaction.transactionalId, false)) {
+					initTransactionalProducer(transaction.getTransactionalId(), false)) {
 				producer.initTransactions();
 			}
 		}
@@ -780,9 +782,9 @@ public class FlinkKafkaProducer011<IN>
 	 * Flush pending records.
 	 * @param transaction
 	 */
-	private void flush(KafkaTransactionState transaction) throws FlinkKafka011Exception {
-		if (transaction.producer != null) {
-			transaction.producer.flush();
+	private void flush(AbstractKafkaTransactionState transaction) throws FlinkKafka011Exception {
+		if (transaction.getProducer() != null) {
+			transaction.getProducer().flush();
 		}
 		long pendingRecordsCount = pendingRecords.get();
 		if (pendingRecordsCount != 0) {
@@ -863,7 +865,7 @@ public class FlinkKafkaProducer011<IN>
 	}
 
 	@Override
-	protected Optional<KafkaTransactionContext> initializeUserContext() {
+	protected Optional<AbstractKafkaTransactionContext> initializeUserContext() {
 		if (semantic != Semantic.EXACTLY_ONCE) {
 			return Optional.empty();
 		}
@@ -884,8 +886,8 @@ public class FlinkKafkaProducer011<IN>
 	@Override
 	protected void finishRecoveringContext() {
 		cleanUpUserContext();
-		resetAvailableTransactionalIdsPool(getUserContext().get().transactionalIds);
-		LOG.info("Recovered transactionalIds {}", getUserContext().get().transactionalIds);
+		resetAvailableTransactionalIdsPool(getUserContext().get().getTransactionalIds());
+		LOG.info("Recovered transactionalIds {}", getUserContext().get().getTransactionalIds());
 	}
 
 	/**
@@ -895,7 +897,7 @@ public class FlinkKafkaProducer011<IN>
 		if (!getUserContext().isPresent()) {
 			return;
 		}
-		abortTransactions(getUserContext().get().transactionalIds);
+		abortTransactions(getUserContext().get().getTransactionalIds());
 	}
 
 	private void resetAvailableTransactionalIdsPool(Collection<String> transactionalIds) {
@@ -916,11 +918,11 @@ public class FlinkKafkaProducer011<IN>
 	}
 
 	int getTransactionCoordinatorId() {
-		final KafkaTransactionState currentTransaction = currentTransaction();
-		if (currentTransaction == null || currentTransaction.producer == null) {
+		final AbstractKafkaTransactionState currentTransaction = currentTransaction();
+		if (currentTransaction == null || currentTransaction.getProducer() == null) {
 			throw new IllegalArgumentException();
 		}
-		return currentTransaction.producer.getTransactionCoordinatorId();
+		return ((FlinkKafkaProducer) currentTransaction.getProducer()).getTransactionCoordinatorId();
 	}
 
 	/**
@@ -1064,16 +1066,9 @@ public class FlinkKafkaProducer011<IN>
 	 */
 	@VisibleForTesting
 	@Internal
-	static class KafkaTransactionState {
+	static class KafkaTransactionState extends AbstractKafkaTransactionState{
 
 		private final transient FlinkKafkaProducer<byte[], byte[]> producer;
-
-		@Nullable
-		final String transactionalId;
-
-		final long producerId;
-
-		final short epoch;
 
 		KafkaTransactionState(String transactionalId, FlinkKafkaProducer<byte[], byte[]> producer) {
 			this(transactionalId, producer.getProducerId(), producer.getEpoch(), producer);
@@ -1088,52 +1083,13 @@ public class FlinkKafkaProducer011<IN>
 				long producerId,
 				short epoch,
 				FlinkKafkaProducer<byte[], byte[]> producer) {
-			this.transactionalId = transactionalId;
-			this.producerId = producerId;
-			this.epoch = epoch;
+			super(transactionalId, producerId, epoch);
 			this.producer = producer;
 		}
 
-		boolean isTransactional() {
-			return transactionalId != null;
-		}
-
 		@Override
-		public String toString() {
-			return String.format(
-				"%s [transactionalId=%s, producerId=%s, epoch=%s]",
-				this.getClass().getSimpleName(),
-				transactionalId,
-				producerId,
-				epoch);
-		}
-
-		@Override
-		public boolean equals(Object o) {
-			if (this == o) {
-				return true;
-			}
-			if (o == null || getClass() != o.getClass()) {
-				return false;
-			}
-
-			KafkaTransactionState that = (KafkaTransactionState) o;
-
-			if (producerId != that.producerId) {
-				return false;
-			}
-			if (epoch != that.epoch) {
-				return false;
-			}
-			return transactionalId != null ? transactionalId.equals(that.transactionalId) : that.transactionalId == null;
-		}
-
-		@Override
-		public int hashCode() {
-			int result = transactionalId != null ? transactionalId.hashCode() : 0;
-			result = 31 * result + (int) (producerId ^ (producerId >>> 32));
-			result = 31 * result + (int) epoch;
-			return result;
+		public Producer<byte[], byte[]> getProducer() {
+			return this.producer;
 		}
 	}
 
@@ -1143,41 +1099,21 @@ public class FlinkKafkaProducer011<IN>
 	 */
 	@VisibleForTesting
 	@Internal
-	public static class KafkaTransactionContext {
-		final Set<String> transactionalIds;
+	public static class KafkaTransactionContext extends AbstractKafkaTransactionContext {
 
 		KafkaTransactionContext(Set<String> transactionalIds) {
-			checkNotNull(transactionalIds);
-			this.transactionalIds = transactionalIds;
+			super (transactionalIds);
 		}
 
-		@Override
-		public boolean equals(Object o) {
-			if (this == o) {
-				return true;
-			}
-			if (o == null || getClass() != o.getClass()) {
-				return false;
-			}
-
-			KafkaTransactionContext that = (KafkaTransactionContext) o;
-
-			return transactionalIds.equals(that.transactionalIds);
-		}
-
-		@Override
-		public int hashCode() {
-			return transactionalIds.hashCode();
-		}
 	}
 
 	/**
 	 * {@link org.apache.flink.api.common.typeutils.TypeSerializer} for
-	 * {@link KafkaTransactionState}.
+	 * {@link AbstractKafkaTransactionState}.
 	 */
 	@VisibleForTesting
 	@Internal
-	public static class TransactionStateSerializer extends TypeSerializerSingleton<KafkaTransactionState> {
+	public static class TransactionStateSerializer extends TypeSerializerSingleton<AbstractKafkaTransactionState> {
 
 		private static final long serialVersionUID = 1L;
 
@@ -1187,19 +1123,19 @@ public class FlinkKafkaProducer011<IN>
 		}
 
 		@Override
-		public KafkaTransactionState createInstance() {
+		public AbstractKafkaTransactionState createInstance() {
 			return null;
 		}
 
 		@Override
-		public KafkaTransactionState copy(KafkaTransactionState from) {
+		public AbstractKafkaTransactionState copy(AbstractKafkaTransactionState from) {
 			return from;
 		}
 
 		@Override
-		public KafkaTransactionState copy(
-			KafkaTransactionState from,
-			KafkaTransactionState reuse) {
+		public AbstractKafkaTransactionState copy(
+			AbstractKafkaTransactionState from,
+			AbstractKafkaTransactionState reuse) {
 			return from;
 		}
 
@@ -1210,20 +1146,20 @@ public class FlinkKafkaProducer011<IN>
 
 		@Override
 		public void serialize(
-				KafkaTransactionState record,
+				AbstractKafkaTransactionState record,
 				DataOutputView target) throws IOException {
-			if (record.transactionalId == null) {
+			if (record.getTransactionalId() == null) {
 				target.writeBoolean(false);
 			} else {
 				target.writeBoolean(true);
-				target.writeUTF(record.transactionalId);
+				target.writeUTF(record.getTransactionalId());
 			}
-			target.writeLong(record.producerId);
-			target.writeShort(record.epoch);
+			target.writeLong(record.getProducerId());
+			target.writeShort(record.getEpoch());
 		}
 
 		@Override
-		public KafkaTransactionState deserialize(DataInputView source) throws IOException {
+		public AbstractKafkaTransactionState deserialize(DataInputView source) throws IOException {
 			String transactionalId = null;
 			if (source.readBoolean()) {
 				transactionalId = source.readUTF();
@@ -1234,8 +1170,8 @@ public class FlinkKafkaProducer011<IN>
 		}
 
 		@Override
-		public KafkaTransactionState deserialize(
-				KafkaTransactionState reuse,
+		public AbstractKafkaTransactionState deserialize(
+				AbstractKafkaTransactionState reuse,
 				DataInputView source) throws IOException {
 			return deserialize(source);
 		}
@@ -1260,7 +1196,7 @@ public class FlinkKafkaProducer011<IN>
 		// ------------------------------------------------------------------------
 
 		@Override
-		public TypeSerializerSnapshot<KafkaTransactionState> snapshotConfiguration() {
+		public TypeSerializerSnapshot<AbstractKafkaTransactionState> snapshotConfiguration() {
 			return new TransactionStateSerializerSnapshot();
 		}
 
@@ -1268,14 +1204,14 @@ public class FlinkKafkaProducer011<IN>
 		 * Serializer configuration snapshot for compatibility and format evolution.
 		 */
 		@SuppressWarnings("WeakerAccess")
-		public static final class TransactionStateSerializerSnapshot implements TypeSerializerSnapshot<KafkaTransactionState> {
+		public static final class TransactionStateSerializerSnapshot implements TypeSerializerSnapshot<AbstractKafkaTransactionState> {
 
 			private static final int CURRENT_VERSION = 1;
 
 			/**
 			 * The class of the serializer for this snapshot.
 			 */
-			private Supplier<? extends TypeSerializer<KafkaTransactionState>> serializerSupplier;
+			private Supplier<? extends TypeSerializer<AbstractKafkaTransactionState>> serializerSupplier;
 
 			public TransactionStateSerializerSnapshot() {
 				serializerSupplier = TransactionStateSerializer::new;
@@ -1287,13 +1223,13 @@ public class FlinkKafkaProducer011<IN>
 			}
 
 			@Override
-			public TypeSerializer<KafkaTransactionState> restoreSerializer() {
+			public TypeSerializer<AbstractKafkaTransactionState> restoreSerializer() {
 				return serializerSupplier.get();
 			}
 
 			@Override
-			public TypeSerializerSchemaCompatibility<KafkaTransactionState>
-			resolveSchemaCompatibility(TypeSerializer<KafkaTransactionState> newSerializer) {
+			public TypeSerializerSchemaCompatibility<AbstractKafkaTransactionState>
+			resolveSchemaCompatibility(TypeSerializer<AbstractKafkaTransactionState> newSerializer) {
 				if (newSerializer.getClass() == serializerSupplier.get().getClass()) {
 					return TypeSerializerSchemaCompatibility.compatibleAsIs();
 				} else if (newSerializer.getClass().getCanonicalName().contains("TransactionStateSerializer")) {
@@ -1343,7 +1279,7 @@ public class FlinkKafkaProducer011<IN>
 	 */
 	@VisibleForTesting
 	@Internal
-	public static class ContextStateSerializer extends TypeSerializerSingleton<KafkaTransactionContext> {
+	public static class ContextStateSerializer extends TypeSerializerSingleton<AbstractKafkaTransactionContext> {
 
 		private static final long serialVersionUID = 1L;
 
@@ -1353,19 +1289,19 @@ public class FlinkKafkaProducer011<IN>
 		}
 
 		@Override
-		public KafkaTransactionContext createInstance() {
+		public AbstractKafkaTransactionContext createInstance() {
 			return null;
 		}
 
 		@Override
-		public KafkaTransactionContext copy(KafkaTransactionContext from) {
+		public AbstractKafkaTransactionContext copy(AbstractKafkaTransactionContext from) {
 			return from;
 		}
 
 		@Override
-		public KafkaTransactionContext copy(
-				KafkaTransactionContext from,
-				KafkaTransactionContext reuse) {
+		public AbstractKafkaTransactionContext copy(
+				AbstractKafkaTransactionContext from,
+				AbstractKafkaTransactionContext reuse) {
 			return from;
 		}
 
@@ -1376,17 +1312,17 @@ public class FlinkKafkaProducer011<IN>
 
 		@Override
 		public void serialize(
-				KafkaTransactionContext record,
+				AbstractKafkaTransactionContext record,
 				DataOutputView target) throws IOException {
-			int numIds = record.transactionalIds.size();
+			int numIds = record.getTransactionalIds().size();
 			target.writeInt(numIds);
-			for (String id : record.transactionalIds) {
+			for (String id : record.getTransactionalIds()) {
 				target.writeUTF(id);
 			}
 		}
 
 		@Override
-		public KafkaTransactionContext deserialize(DataInputView source) throws IOException {
+		public AbstractKafkaTransactionContext deserialize(DataInputView source) throws IOException {
 			int numIds = source.readInt();
 			Set<String> ids = new HashSet<>(numIds);
 			for (int i = 0; i < numIds; i++) {
@@ -1396,8 +1332,8 @@ public class FlinkKafkaProducer011<IN>
 		}
 
 		@Override
-		public KafkaTransactionContext deserialize(
-				KafkaTransactionContext reuse,
+		public AbstractKafkaTransactionContext deserialize(
+				AbstractKafkaTransactionContext reuse,
 				DataInputView source) throws IOException {
 			return deserialize(source);
 		}
@@ -1421,7 +1357,7 @@ public class FlinkKafkaProducer011<IN>
 		// ------------------------------------------------------------------------
 
 		@Override
-		public TypeSerializerSnapshot<KafkaTransactionContext> snapshotConfiguration() {
+		public TypeSerializerSnapshot<AbstractKafkaTransactionContext> snapshotConfiguration() {
 			return new ContextStateSerializerSnapshot();
 		}
 
@@ -1429,14 +1365,14 @@ public class FlinkKafkaProducer011<IN>
 		 * Serializer configuration snapshot for compatibility and format evolution.
 		 */
 		@SuppressWarnings("WeakerAccess")
-		public static final class ContextStateSerializerSnapshot implements TypeSerializerSnapshot<KafkaTransactionContext> {
+		public static final class ContextStateSerializerSnapshot implements TypeSerializerSnapshot<AbstractKafkaTransactionContext> {
 
 			private static final int CURRENT_VERSION = 1;
 
 			/**
 			 * The class of the serializer for this snapshot.
 			 */
-			private Supplier<? extends TypeSerializer<KafkaTransactionContext>> serializerSupplier;
+			private Supplier<? extends TypeSerializer<AbstractKafkaTransactionContext>> serializerSupplier;
 
 			public ContextStateSerializerSnapshot() {
 				serializerSupplier = ContextStateSerializer::new;
@@ -1448,12 +1384,12 @@ public class FlinkKafkaProducer011<IN>
 			}
 
 			@Override
-			public TypeSerializer<KafkaTransactionContext> restoreSerializer() {
+			public TypeSerializer<AbstractKafkaTransactionContext> restoreSerializer() {
 				return serializerSupplier.get();
 			}
 
 			@Override
-			public TypeSerializerSchemaCompatibility<KafkaTransactionContext> resolveSchemaCompatibility(TypeSerializer<KafkaTransactionContext> newSerializer) {
+			public TypeSerializerSchemaCompatibility<AbstractKafkaTransactionContext> resolveSchemaCompatibility(TypeSerializer<AbstractKafkaTransactionContext> newSerializer) {
 				if (newSerializer.getClass() == serializerSupplier.get().getClass()) {
 					return TypeSerializerSchemaCompatibility.compatibleAsIs();
 				} else if (newSerializer.getClass().getCanonicalName().contains("ContextStateSerializer")) {
